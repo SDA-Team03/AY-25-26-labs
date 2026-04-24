@@ -11,4 +11,5 @@
 *.code-workspace
 
 # MZinga local clone
-mzinga/
+#mzinga/
+**/.venv

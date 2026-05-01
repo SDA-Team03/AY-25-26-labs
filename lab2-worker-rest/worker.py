@@ -11,49 +11,24 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-MZINGA_URL = os.environ["MZINGA_URL"]
-MZINGA_EMAIL = os.environ["MZINGA_EMAIL"]
-MZINGA_PASSWORD = os.environ["MZINGA_PASSWORD"]
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL_SECONDS", 5))
 SMTP_HOST = os.getenv("SMTP_HOST", "localhost")
 SMTP_PORT = int(os.getenv("SMTP_PORT", 1025))
 EMAIL_FROM = os.getenv("EMAIL_FROM", "worker@mzinga.io")
 
-
-def login() -> str:
-    resp = requests.post(
-        f"{MZINGA_URL}/api/users/login",
-        json={"email": MZINGA_EMAIL, "password": MZINGA_PASSWORD},
-    )
-    resp.raise_for_status()
-    log.info("Authenticated with MZinga API")
-    return resp.json()["token"]
+MZINGA_URL = os.getenv("MZINGA_URL")
+MZINGA_PASSWORD = os.getenv("MZINGA_PASSWORD")
+MZINGA_EMAIL = os.getenv("MZINGA_EMAIL")
 
 
-def auth_headers(token: str) -> dict:
-    return {"Authorization": f"Bearer {token}"}
-
-
-def fetch_pending(token: str) -> list:
-    resp = requests.get(
-        f"{MZINGA_URL}/api/communications",
-        params={"where[status][equals]": "pending", "depth": 1},
-        headers=auth_headers(token),
-    )
-    resp.raise_for_status()
-    return resp.json().get("docs", [])
-
-
-def update_status(token: str, doc_id: str, status: str):
-    resp = requests.patch(
-        f"{MZINGA_URL}/api/communications/{doc_id}",
-        json={"status": status},
-        headers=auth_headers(token),
-    )
-    resp.raise_for_status()
+PENDING_STATUS = "pending"
+PROCESSING_STATUS = "processing"
+SENT_STATUS = "sent"
+FAILED_STATUS = "failed"
 
 
 def slate_to_html(nodes: list) -> str:
+    """Minimal Slate AST → HTML serialiser."""
     html = ""
     for node in nodes or []:
         if node.get("type") == "paragraph":
@@ -81,7 +56,7 @@ def slate_to_html(nodes: list) -> str:
     return html
 
 
-def extract_emails(relationship_list: list) -> list[str]:
+def resolve_emails(relationship_list: list) -> list[str]:
     emails = []
     for r in relationship_list or []:
         value = r.get("value") or {}
@@ -104,43 +79,89 @@ def send_email(to_addresses: list[str], subject: str, html: str,
         server.sendmail(EMAIL_FROM, all_recipients, msg.as_string())
 
 
-def process(token: str, doc: dict):
-    doc_id = doc["id"]
+def process(doc: dict, token: str) -> None:
+    doc_id = doc.get("id")
+
     log.info(f"Processing communication {doc_id}")
-    update_status(token, doc_id, "processing")
+
+    update_status_by_communication_id(token, doc_id, PROCESSING_STATUS)
     try:
-        to_emails = extract_emails(doc.get("tos"))
+        to_emails = resolve_emails(doc.get("tos") or [])
         if not to_emails:
             raise ValueError("No valid 'to' email addresses found")
-        cc_emails = extract_emails(doc.get("ccs"))
-        bcc_emails = extract_emails(doc.get("bccs"))
+        cc_emails = resolve_emails(doc.get("ccs") or [])
+        bcc_emails = resolve_emails(doc.get("bccs") or [])
         html = slate_to_html(doc.get("body") or [])
+
         send_email(to_emails, doc["subject"], html, cc_emails, bcc_emails)
-        update_status(token, doc_id, "sent")
+        
+        update_status_by_communication_id(token, doc_id, SENT_STATUS)
+
         log.info(f"Communication {doc_id} sent successfully")
     except Exception as e:
         log.error(f"Failed to process communication {doc_id}: {e}")
-        update_status(token, doc_id, "failed")
+        update_status_by_communication_id(token, doc_id, FAILED_STATUS)
 
 
-def poll():
-    token = login()
-    log.info(f"Worker started. Polling every {POLL_INTERVAL}s")
-    while True:
-        try:
-            docs = fetch_pending(token)
-            for doc in docs:
-                process(token, doc)
-            if not docs:
-                time.sleep(POLL_INTERVAL)
-        except requests.HTTPError as e:
-            if e.response.status_code == 401:
-                log.warning("Token expired, re-authenticating")
-                token = login()
-            else:
-                log.error(f"HTTP error: {e}")
-                time.sleep(POLL_INTERVAL)
+
+def auth_headers(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def login() -> str:
+    resp = requests.post(
+        f"{MZINGA_URL}/api/users/login",
+        json={f"email": MZINGA_EMAIL, "password": MZINGA_PASSWORD},
+    )
+
+    return resp.json()["token"]
+
+
+def list_pending_docs(token: str) -> dict:
+    res = requests.get(
+        f"{MZINGA_URL}/api/communications/?where[status][equals]=pending&depth=1",
+        headers=auth_headers(token)
+    )
+    res.raise_for_status()
+    return res.json()["docs"]
+
+def get_communication_by_id(token: str, id: str) -> dict:
+    res = requests.get(
+        f"{MZINGA_URL}/api/communications/{id}?depth=1",
+        headers=auth_headers(token)
+    )
+
+    res.raise_for_status()
+    return res.json()
+
+
+def update_status_by_communication_id(token: str, id: str, new_status: str) -> None:
+    res = requests.patch(
+        f"{MZINGA_URL}/api/communications/{id}",
+        json={"status" : f"{new_status}"},
+        headers=auth_headers(token),
+    )
+    res.raise_for_status()
+
 
 
 if __name__ == "__main__":
-    poll()
+    log.info(f"Worker started. Polling every {POLL_INTERVAL}s")
+
+    token = login()
+
+    while True:
+        try:
+            docs = list_pending_docs(token)
+            if docs:
+                for doc in docs:
+                    process(doc, token)
+            else:
+                time.sleep(POLL_INTERVAL)
+        except requests.HTTPError as e:
+            if e.response.status_code == 401:
+                log.warning("Re-logging...")
+                token=login()
+            else:
+                log.error(f"HTTP Error: {e}")
+                time.sleep(POLL_INTERVAL)

@@ -78,6 +78,52 @@ Rather than storing only the current `status` of a `Communications` document, st
 
 ---
 
+## Patterns for Deployment and Release
+
+These patterns govern how a service moves from a built artifact to a running version in production — and how that transition is made safe, reversible, and observable. They become relevant once the email worker exists as a standalone service (States 1–3) and needs to be updated without disrupting ongoing communications processing.
+
+### Immutable Infrastructure
+
+A container image, once built, is never modified. New requirements or bug fixes produce a new image tag; the old image is replaced, not patched. This is the foundational premise of all Kubernetes deployment strategies — Pods are disposable units that are replaced as a group or individually, never modified in place while running.
+
+For the email worker, immutability means every change produces a new tagged image (`email-worker:1.2.0`, `email-worker:1.3.0`). The image registry becomes the authoritative record of what ran in production at any point in time. Rollback is a re-deploy of the previous tag, not a reversal of a sequence of manual changes — a critical difference when diagnosing production incidents.
+
+### Health Endpoint Monitor
+
+A dedicated HTTP endpoint — conventionally `/health` — that reports whether the service instance is ready to receive traffic. In Kubernetes this is the target of the readiness probe. The critical distinction is between **running** (the process is alive) and **ready** (initialised and able to serve requests correctly). A worker that starts its HTTP server before completing its RabbitMQ connection or before obtaining a valid JWT token is running but not ready.
+
+Without a correct health endpoint, rolling updates and canary releases cannot safely gate traffic: Kubernetes would route requests to a Pod that has started but not yet established its dependencies, causing failures that would not have occurred if the Pod had simply waited another two seconds. The health endpoint is the contract between the service and the orchestrator — the service decides when it is ready, and the infrastructure respects that signal.
+
+### Graceful Shutdown
+
+On receiving a termination signal (`SIGTERM`), the service stops accepting new work, completes in-flight processing, and exits cleanly. In Kubernetes, `terminationGracePeriodSeconds` (default 30 seconds) defines how long the Pod has to complete this sequence before being forcibly killed.
+
+For the email worker this has a concrete consequence: if the worker receives `SIGTERM` while it has already called `PATCH /api/communications/:id` with `status: "processing"` but has not yet sent the email, the document is left in `processing` state indefinitely. The next version of the worker must detect and recover these orphaned documents — adding complexity that would not exist if the original worker had simply finished its current document before exiting. Graceful shutdown eliminates this class of consistency gap.
+
+> Graceful shutdown is the invisible prerequisite for zero-downtime deployment. A service that ignores `SIGTERM` makes every rolling update destructive regardless of the Kubernetes strategy configured.
+
+### Parallel Change (Expand-Contract)
+
+A schema evolution pattern that makes rolling updates and canary releases safe for changes to message formats, database schemas, or API contracts. Instead of replacing the old format with the new one in a single deployment — which would make v1 and v2 simultaneously incompatible and force a Recreate or Blue-Green strategy — the change is decomposed into three sequential deployments:
+
+1. **Expand** — deploy a version that reads and writes both the old and new format. No existing consumer or producer breaks. The queue, the database, and the API accept both shapes.
+2. **Migrate** — once all instances are running the expanded version, begin writing the new format exclusively. Old instances can still read it because the expanded version already handled both.
+3. **Contract** — once no instances of the old version remain, deploy a final version that drops the old format entirely.
+
+Applied to the email worker: if the RabbitMQ message schema changes from `{ "doc_id": "abc123" }` to `{ "communication_id": "abc123", "tenant": "acme" }`, a direct single-deployment replacement would cause v1 worker Pods — still running during a rolling update — to fail to parse v2 messages. Expand-Contract publishes both keys during the transition window, allowing both versions to consume from the same queue without errors.
+
+> This pattern converts a breaking change — one that requires Recreate (downtime) or Blue-Green (double resources) — into a backwards-compatible change that any strategy can handle safely. The cost is three deployments instead of one and temporary code complexity in the expanded state. The trade-off is almost always worth it when the service handles real user data.
+
+### Dark Launch
+
+A variant of canary release where the new version receives a copy of every production request but its responses are discarded — only internal metrics and logs are observed. Users are never exposed to the new version's output. This eliminates user-facing risk entirely while preserving the ability to test the new version against real production traffic volumes and data shapes.
+
+In a queue-based context — directly relevant to the email worker — dark launch does not require HTTP request duplication infrastructure. The worker subscribes to a shadow copy of the RabbitMQ queue, processes messages with the same logic, but writes results to a comparison log rather than back to the MZinga API. Error rates, processing times, and rendered output can be compared between the shadow run and the live run before any user is affected.
+
+> Dark launch is particularly relevant for the email worker when changing the `slate_to_html` rendering logic: the new renderer can be validated against real `Communications` document bodies, with rendered HTML compared between versions, without sending any emails to real recipients.
+
+---
+
 ## Summary Map
 
 | Phase | Pattern | Concern it solves |
@@ -94,6 +140,11 @@ Rather than storing only the current `status` of a `Communications` document, st
 | Event-driven | Event Carried State Transfer | Eliminates REST API call, reduces latency |
 | Event-driven | Saga | Coordinates multi-channel dispatch with compensatable steps |
 | Event-driven | Event Sourcing | Full audit trail of every delivery attempt |
+| Deployment | Immutable Infrastructure | Ensures rollback is a re-deploy of a previous tag, not a reversal of manual changes |
+| Deployment | Health Endpoint Monitor | Gates traffic during rolling updates and canary — only ready Pods receive requests |
+| Deployment | Graceful Shutdown | Prevents in-flight work loss on Pod termination in any deployment strategy |
+| Deployment | Parallel Change (Expand-Contract) | Converts breaking schema or protocol changes into backwards-compatible ones, enabling rolling/canary |
+| Deployment | Dark Launch | Tests new version against real production traffic with zero user-facing exposure |
 
 ---
 

@@ -42,8 +42,16 @@ function main() {
   );
   const OTEL_EXPORTER_URL =
     process.env.OTEL_EXPORTER_OTLP_ENDPOINT || "http://localhost:4318";
+  
+  
+  
+  
   const exporter = new OTLPTraceExporter({});
-  const detectors = [
+  
+  
+  
+  
+    const detectors = [
     containerDetector,
     envDetector,
     hostDetector,
@@ -53,6 +61,10 @@ function main() {
   detectResources({
     detectors,
   });
+
+
+
+
 
   const resource = defaultResource().merge(
     resourceFromAttributes({
@@ -65,13 +77,24 @@ function main() {
     }),
   );
   const spanProcessors = [new BatchSpanProcessor(exporter)];
+  
   if (process.env.OTEL_CONSOLE_EXPORTER) {
     spanProcessors.push(new BatchSpanProcessor(new LokiExporter()));
   }
+
+
   const tracerProvider = new NodeTracerProvider({
     resource,
     spanProcessors: spanProcessors,
   });
+
+
+
+
+
+
+
+
 
   registerInstrumentations({
     tracerProvider: tracerProvider,

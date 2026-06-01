@@ -7,22 +7,19 @@ from email.mime.text import MIMEText
 from dotenv import load_dotenv
 import requests
 import structlog
-
 from opentelemetry import trace
+from opentelemetry.trace import StatusCode
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.resources import Resource, SERVICE_NAME, SERVICE_VERSION
 from opentelemetry.instrumentation.requests import RequestsInstrumentor
-
-# OpenTelemetry — metrics
 from opentelemetry import metrics
 from opentelemetry.sdk.metrics import MeterProvider
-from opentelemetry.exporter.prometheus import PrometheusMetricReader  # <-- Updated import
+from opentelemetry.exporter.prometheus import PrometheusMetricReader
 from prometheus_client import start_http_server
 
 load_dotenv()
-
 
 MZINGA_URL = os.environ["MZINGA_URL"]
 MZINGA_EMAIL = os.environ["MZINGA_EMAIL"]
@@ -35,86 +32,67 @@ OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318"
 SERVICE_NAME_VALUE = os.getenv("OTEL_SERVICE_NAME", "email-worker")
 PROMETHEUS_PORT = int(os.getenv("PROMETHEUS_PORT", 8000))
 
-
-resource = Resource(attributes={
-    SERVICE_NAME: SERVICE_NAME_VALUE,
-    SERVICE_VERSION: "1.0.0",
-})
-
-tracer_provider = TracerProvider(resource=resource)
-otlp_exporter = OTLPSpanExporter(endpoint=f"{OTLP_ENDPOINT}/v1/traces")
-tracer_provider.add_span_processor(BatchSpanProcessor(otlp_exporter))
-trace.set_tracer_provider(tracer_provider)
-
-RequestsInstrumentor().instrument()
-
-tracer = trace.get_tracer(SERVICE_NAME_VALUE)
-
-# ── OpenTelemetry: Metrics ────────────────────────────────────────────────────
-
-start_http_server(port=PROMETHEUS_PORT)
-
-metric_reader = PrometheusMetricReader()
-meter_provider = MeterProvider(resource=resource, metric_readers=[metric_reader])
-metrics.set_meter_provider(meter_provider)
-
-meter = metrics.get_meter(SERVICE_NAME_VALUE)
-
-emails_processed = meter.create_counter(
-    name="emails_processed_total",
-    description="Total number of communications processed",
-    unit="1",
-)
-processing_duration = meter.create_histogram(
-    name="email_processing_duration_seconds",
-    description="End-to-end duration of processing one communication",
-    unit="s",
-)
-smtp_duration = meter.create_histogram(
-    name="smtp_send_duration_seconds",
-    description="Duration of the SMTP send call",
-    unit="s",
-)
-poll_counter = meter.create_counter(
-    name="worker_poll_total",
-    description="Number of poll cycles",
-    unit="1",
-)
+# Metric variables (initialized by setup_metrics)
+emails_processed = None
+processing_duration = None
+smtp_duration = None
+poll_counter = None
 
 
-def add_otel_context(logger, method, event_dict):
-    """Inject active trace_id and span_id into every log entry."""
-    span = trace.get_current_span()
-    ctx = span.get_span_context()
-    if ctx.is_valid:
-        event_dict["trace_id"] = format(ctx.trace_id, "032x")
-        event_dict["span_id"] = format(ctx.span_id, "016x")
-    return event_dict
-
-structlog.configure(
-    processors=[
-        structlog.contextvars.merge_contextvars,
-        structlog.processors.add_log_level,
-        structlog.processors.TimeStamper(fmt="iso"),
-        add_otel_context,
-        structlog.processors.JSONRenderer(),
-    ],
-    wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
-    context_class=dict,
-    logger_factory=structlog.PrintLoggerFactory(),
-)
-log = structlog.get_logger(service=SERVICE_NAME_VALUE)
+def setup_tracing_and_requests():
+    resource = Resource(attributes={SERVICE_NAME: SERVICE_NAME_VALUE, SERVICE_VERSION: "1.0.0"})
+    provider = TracerProvider(resource=resource)
+    exporter = OTLPSpanExporter(endpoint=f"{OTLP_ENDPOINT}/v1/traces")
+    provider.add_span_processor(BatchSpanProcessor(exporter))
+    trace.set_tracer_provider(provider)
+    RequestsInstrumentor().instrument()
+    return trace.get_tracer(SERVICE_NAME_VALUE)
 
 
+def setup_metrics():
+    start_http_server(port=PROMETHEUS_PORT)
+    reader = PrometheusMetricReader()
+    meter_provider = MeterProvider(resource=Resource(attributes={SERVICE_NAME: SERVICE_NAME_VALUE}), metric_readers=[reader])
+    metrics.set_meter_provider(meter_provider)
+    meter = metrics.get_meter(SERVICE_NAME_VALUE)
+
+    globals()["emails_processed"] = meter.create_counter(name="emails_processed_total", description="Total number of communications processed", unit="1")
+    globals()["processing_duration"] = meter.create_histogram(name="email_processing_duration_seconds", description="End-to-end duration of processing one communication", unit="s")
+    globals()["smtp_duration"] = meter.create_histogram(name="smtp_send_duration_seconds", description="Duration of the SMTP send call", unit="s")
+    globals()["poll_counter"] = meter.create_counter(name="worker_poll_total", description="Number of poll cycles", unit="1")
 
 
+def setup_logging():
+    def add_otel_context(logger, method, event_dict):
+        span = trace.get_current_span()
+        ctx = span.get_span_context()
+        if ctx.is_valid:
+            event_dict["trace_id"] = format(ctx.trace_id, "032x")
+            event_dict["span_id"] = format(ctx.span_id, "016x")
+        return event_dict
+
+    structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            structlog.processors.add_log_level,
+            structlog.processors.TimeStamper(fmt="iso"),
+            add_otel_context,
+            structlog.processors.JSONRenderer(),
+        ],
+        wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
+        context_class=dict,
+        logger_factory=structlog.PrintLoggerFactory(),
+    )
+    return structlog.get_logger(service=SERVICE_NAME_VALUE)
+
+
+tracer = setup_tracing_and_requests()
+setup_metrics()
+log = setup_logging()
 
 
 def login() -> str:
-    resp = requests.post(
-        f"{MZINGA_URL}/api/users/login",
-        json={"email": MZINGA_EMAIL, "password": MZINGA_PASSWORD},
-    )
+    resp = requests.post(f"{MZINGA_URL}/api/users/login", json={"email": MZINGA_EMAIL, "password": MZINGA_PASSWORD})
     resp.raise_for_status()
     log.info("authenticated")
     return resp.json()["token"]
@@ -146,15 +124,9 @@ def fetch_doc(token: str, doc_id: str) -> dict:
 
 def update_status(token: str, doc_id: str, status: str):
     resp = requests.patch(
-        f"{MZINGA_URL}/api/communications/{doc_id}",
-        json={"status": status},
-        headers=auth_headers(token),
+        f"{MZINGA_URL}/api/communications/{doc_id}", json={"status": status}, headers=auth_headers(token)
     )
     resp.raise_for_status()
-
-
-
-
 
 
 def slate_to_html(nodes: list) -> str:
@@ -194,78 +166,68 @@ def extract_emails(relationship_list: list) -> list[str]:
     return emails
 
 
-def send_email(to_addresses: list[str], subject: str, html: str,
-               cc_addresses: list[str] = None, bcc_addresses: list[str] = None):
+def build_message(to_addresses: list[str], subject: str, html: str, cc_addresses: list[str] = None, bcc_addresses: list[str] = None):
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = EMAIL_FROM
+    msg["To"] = ", ".join(to_addresses)
+    if cc_addresses:
+        msg["Cc"] = ", ".join(cc_addresses)
+    msg.attach(MIMEText(html, "html"))
+    all_recipients = to_addresses + (cc_addresses or []) + (bcc_addresses or [])
+    return msg, all_recipients
+
+
+def smtp_send(msg, recipients):
+    t0 = time.perf_counter()
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.sendmail(EMAIL_FROM, recipients, msg.as_string())
+    smtp_duration.record(time.perf_counter() - t0)
+
+
+def send_email(to_addresses: list[str], subject: str, html: str, cc_addresses: list[str] = None, bcc_addresses: list[str] = None):
     with tracer.start_as_current_span("send_email") as span:
         span.set_attribute("recipient_count", len(to_addresses))
-        t0 = time.perf_counter()
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = subject
-        msg["From"] = EMAIL_FROM
-        msg["To"] = ", ".join(to_addresses)
-        if cc_addresses:
-            msg["Cc"] = ", ".join(cc_addresses)
-        msg.attach(MIMEText(html, "html"))
-        all_recipients = to_addresses + (cc_addresses or []) + (bcc_addresses or [])
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
-            server.sendmail(EMAIL_FROM, all_recipients, msg.as_string())
-        smtp_duration.record(time.perf_counter() - t0)
-
-
-
+        msg, recipients = build_message(to_addresses, subject, html, cc_addresses, bcc_addresses)
+        smtp_send(msg, recipients)
 
 
 def process(token: str, doc: dict) -> str:
     doc_id = doc["id"]
     structlog.contextvars.bind_contextvars(doc_id=doc_id)
-
     with tracer.start_as_current_span("process_communication") as span:
         span.set_attribute("doc_id", doc_id)
         t0 = time.perf_counter()
-
         update_status(token, doc_id, "processing")
         log.info("processing_started")
-
         try:
             to_emails = extract_emails(doc.get("tos"))
             if not to_emails:
                 raise ValueError("No valid 'to' email addresses found")
             cc_emails = extract_emails(doc.get("ccs"))
             bcc_emails = extract_emails(doc.get("bccs"))
-
             with tracer.start_as_current_span("serialize_body") as s:
                 nodes = doc.get("body") or []
                 s.set_attribute("node_count", len(nodes))
                 html = slate_to_html(nodes)
-
             send_email(to_emails, doc["subject"], html, cc_emails, bcc_emails)
             update_status(token, doc_id, "sent")
-
             duration = time.perf_counter() - t0
             processing_duration.record(duration)
             emails_processed.add(1, {"status": "sent", "recipient_count": len(to_emails)})
             log.info("processing_completed", status="sent", duration_s=round(duration, 3))
-
         except Exception as e:
-            span.set_status(trace.StatusCode.ERROR, str(e))
+            span.set_status(StatusCode.ERROR, str(e))
             span.record_exception(e)
             update_status(token, doc_id, "failed")
             emails_processed.add(1, {"status": "failed", "recipient_count": 0})
             log.error("processing_failed", error=str(e))
-
     structlog.contextvars.unbind_contextvars("doc_id")
     return token
 
 
-
-
 def poll():
-    try:
-        token = login()
-    except Exception as e:
-        print(f"error: {e}")
-        return
-
+    token = login()
     log.info("worker_started", poll_interval_s=POLL_INTERVAL, prometheus_port=PROMETHEUS_PORT)
     while True:
         try:

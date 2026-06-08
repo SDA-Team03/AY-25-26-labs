@@ -7,7 +7,7 @@ metadata:
     app: webapp
     track: stable
 spec:
-  replicas: 9        # 9 stable + 1 canary = ~10% canary traffic
+  replicas: 9
   selector:
     matchLabels:
       app: webapp

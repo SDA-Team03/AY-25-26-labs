@@ -9,7 +9,7 @@ APP_COLOR = os.getenv("APP_COLOR", "blue")
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        pass  # suppress default Apache-style access log
+        pass
 
     def do_GET(self):
         if self.path == "/health":

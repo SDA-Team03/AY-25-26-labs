@@ -6,7 +6,7 @@ metadata:
 spec:
   selector:
     app: webapp
-    slot: blue        # change to "green" to switch all traffic to the green deployment
+    slot: blue
   ports:
     - port: 80
       targetPort: 8080

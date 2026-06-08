@@ -11,7 +11,7 @@ spec:
     matchLabels:
       app: webapp
   strategy:
-    type: Recreate      # all old Pods terminate before any new Pod starts
+    type: Recreate
   template:
     metadata:
       labels:
